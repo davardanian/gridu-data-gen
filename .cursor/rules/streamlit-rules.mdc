@@ -1,0 +1,7 @@
+---
+alwaysApply: true
+---
+
+You are developing an application with streamlit. When introducing new code or making changing to exisitng codebase, always adhere to Streamlit Best practices and use only Streamlit Native Elements. Use Context7
+
+Never over enginner and create complex code when the fix can be implemented using existing code and simpler methods.
