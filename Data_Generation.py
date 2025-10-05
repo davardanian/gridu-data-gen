@@ -240,6 +240,25 @@ def generate_data_workflow_from_ddl(instructions, temperature, num_records, ddl_
     """Main data generation workflow from DDL content"""
     start_time = time.time()
     
+    # Create Langfuse trace for this workflow
+    trace = observability.create_trace(
+        name="data_generation_workflow",
+        user_id="streamlit_user",
+        session_id=f"session_{int(time.time())}",
+        input_data={
+            "instructions": instructions,
+            "temperature": temperature,
+            "num_records": num_records,
+            "ddl_length": len(ddl_content),
+            "drop_existing": drop_existing
+        },
+        metadata={
+            "workflow_type": "ddl_to_data",
+            "timestamp": start_time
+        },
+        tags=["data_generation", "postgresql", "ai_workflow"]
+    )
+    
     try:
         observability.log_user_action("data_generation_workflow_from_ddl_start",
                                     instructions_provided=bool(instructions),
@@ -260,12 +279,28 @@ def generate_data_workflow_from_ddl(instructions, temperature, num_records, ddl_
         
         with st.spinner("Generating AI data from PostgreSQL schema..."):
             observability.log_workflow_step("main_workflow_ddl", "ai_generation", "start")
+            
+            # Create AI generation trace
+            ai_generation = observability.create_generation(
+                trace=trace,
+                name="ai_data_generation",
+                model="gemini-2.5-flash",
+                input_data=f"DDL: {ddl_content[:200]}...\nInstructions: {instructions}",
+                metadata={
+                    "temperature": temperature,
+                    "num_records": num_records,
+                    "ddl_length": len(ddl_content)
+                }
+            )
+            
             # Check authentication before proceeding
             auth_status = auth_manager.get_authentication_status()
             if not auth_status["authenticated"]:
                 observability.log_workflow_step("main_workflow_ddl", "ai_generation", "error",
                                               error="authentication_required")
                 st.error("❌ Authentication required for data generation. Please authenticate first.")
+                if ai_generation:
+                    ai_generation.update(output="Authentication failed")
                 return
             
             data_generator = DataGenerationOrchestrator()
@@ -275,6 +310,12 @@ def generate_data_workflow_from_ddl(instructions, temperature, num_records, ddl_
                 temperature=temperature,
                 num_records=num_records
             )
+            
+            # Complete AI generation trace
+            if ai_generation and generated_data:
+                ai_generation.update(
+                    output=f"Generated {len(generated_data)} tables with data"
+                )
         
         if generated_data:
             observability.log_workflow_step("main_workflow_ddl", "ai_generation", "success",
@@ -286,13 +327,39 @@ def generate_data_workflow_from_ddl(instructions, temperature, num_records, ddl_
                 
                 db_manager = DatabaseManager()
                 # Create tables from DDL with drop_existing option
-                db_manager.create_tables_from_ddl(ddl_content, drop_existing=drop_existing)
+                table_creation_success = db_manager.create_tables_from_ddl(ddl_content, drop_existing=drop_existing)
+                
+                if not table_creation_success:
+                    st.error("❌ Failed to create database tables. Cannot proceed with data insertion.")
+                    return
                 
                 # Store generated data in PostgreSQL with proper dependency order
-                db_manager.store_generated_data(generated_data, ddl_content)
-            
-            # Store in session state for compatibility (but data is now in PostgreSQL)
-            st.session_state["generated_tables"] = generated_data
+                insertion_results = db_manager.store_generated_data(generated_data, ddl_content)
+                
+                # Check insertion results
+                successful_tables = [table for table, success in insertion_results.items() if success]
+                failed_tables = [table for table, success in insertion_results.items() if not success]
+                
+                if failed_tables:
+                    if successful_tables:
+                        st.warning(f"⚠️ **Partial Success**: {len(successful_tables)}/{len(insertion_results)} tables inserted successfully")
+                        st.error(f"❌ **Failed Tables**: {', '.join(failed_tables)}")
+                        st.info("💡 **Tip**: Try running the data generation again - the system will now properly handle table recreation.")
+                        
+                        # Only store successfully inserted tables in session state
+                        successful_data = {table: generated_data[table] for table in successful_tables if table in generated_data}
+                        st.session_state["generated_tables"] = successful_data
+                    else:
+                        st.error(f"❌ **All Tables Failed**: None of the {len(insertion_results)} tables could be inserted")
+                        st.error(f"**Failed Tables**: {', '.join(failed_tables)}")
+                        st.info("💡 **Tip**: The tables may already exist with data. Try running the data generation again - the system will now properly handle table recreation.")
+                        
+                        # Don't store any data in session state if all insertions failed
+                        if "generated_tables" in st.session_state:
+                            del st.session_state["generated_tables"]
+                else:
+                    # All tables inserted successfully
+                    st.session_state["generated_tables"] = generated_data
             
             # Store schema info for query generation
             from core.ddl_parser import DDLParser
@@ -323,19 +390,90 @@ def generate_data_workflow_from_ddl(instructions, temperature, num_records, ddl_
                 observability.log_info(f"Schema verification failed: {e}")
             
             total_duration = time.time() - start_time
-            observability.log_user_action("data_generation_workflow_from_ddl_success",
-                                        total_duration=total_duration,
-                                        tables_generated=len(generated_data))
-            observability.log_performance("complete_data_generation_workflow_from_ddl", total_duration,
-                                        tables=len(generated_data),
-                                        records_per_table=num_records)
             
-            st.success("✅ Data generation completed successfully! Data is now stored in PostgreSQL.")
+            # Check if we have any data in session state (successful insertions)
+            if "generated_tables" in st.session_state and st.session_state["generated_tables"]:
+                successful_count = len(st.session_state["generated_tables"])
+                total_count = len(generated_data)
+                
+                if successful_count == total_count:
+                    # All tables inserted successfully
+                    observability.log_user_action("data_generation_workflow_from_ddl_success",
+                                                total_duration=total_duration,
+                                                tables_generated=successful_count)
+                    observability.log_performance("complete_data_generation_workflow_from_ddl", total_duration,
+                                                tables=successful_count,
+                                                records_per_table=num_records)
+                    
+                    # Complete the main trace
+                    if trace:
+                        trace.update(
+                            output=f"Successfully generated and inserted {successful_count} tables",
+                            metadata={
+                                "tables_generated": successful_count,
+                                "total_duration": total_duration,
+                                "records_per_table": num_records
+                            }
+                        )
+                    
+                    st.success(f"✅ Data generation completed successfully! {successful_count} tables with data are now stored in PostgreSQL.")
+                else:
+                    # Partial success
+                    observability.log_user_action("data_generation_workflow_from_ddl_partial_success",
+                                                total_duration=total_duration,
+                                                tables_generated=successful_count,
+                                                tables_failed=total_count - successful_count)
+                    
+                    # Complete the main trace
+                    if trace:
+                        trace.update(
+                            output=f"Partially successful: {successful_count}/{total_count} tables inserted",
+                            metadata={
+                                "tables_generated": successful_count,
+                                "tables_failed": total_count - successful_count,
+                                "total_duration": total_duration,
+                                "records_per_table": num_records
+                            }
+                        )
+                    
+                    st.warning(f"⚠️ Partial success: {successful_count}/{total_count} tables were successfully inserted into PostgreSQL.")
+            else:
+                # No successful insertions
+                observability.log_user_action("data_generation_workflow_from_ddl_failed",
+                                            total_duration=total_duration,
+                                            tables_generated=0)
+                
+                # Complete the main trace
+                if trace:
+                    trace.update(
+                        output="Data generation failed - no tables inserted",
+                        metadata={
+                            "tables_generated": 0,
+                            "total_duration": total_duration,
+                            "records_per_table": num_records
+                        }
+                    )
+                
+                st.error("❌ Data generation failed. No tables were successfully inserted into PostgreSQL.")
+            
+            # Flush traces to Langfuse
+            observability.flush_traces()
             st.rerun()
         else:
             observability.log_workflow_step("main_workflow_ddl", "ai_generation", "error",
                                           error="no_data_generated")
+            
+            # Complete the main trace with error
+            if trace:
+                trace.update(
+                    output="Data generation failed - no data generated",
+                    metadata={"error": "no_data_generated"}
+                )
+            
             st.error("❌ Data generation failed. No data was generated for any table.")
+            
+            # Flush traces to Langfuse
+            observability.flush_traces()
             
             # Enhanced troubleshooting section
             with st.expander("🔧 Troubleshooting Guide", expanded=True):
@@ -380,10 +518,25 @@ def generate_data_workflow_from_ddl(instructions, temperature, num_records, ddl_
                                     error=str(e),
                                     duration=total_duration)
         observability.log_exception(e, "data_generation_workflow_from_ddl")
+        
+        # Complete the main trace with error
+        if trace:
+            trace.update_trace(
+                output=f"Data generation failed: {str(e)}",
+                metadata={"error": str(e), "error_type": type(e).__name__}
+            )
+        
         st.error(f"Data generation failed: {str(e)}")
         # Log the error for debugging
         import traceback
         st.error(f"Error details: {traceback.format_exc()}")
+        
+        # Flush traces to Langfuse even on error
+        observability.flush_traces()
+
+# Ensure traces are flushed when Streamlit session ends
+import atexit
+atexit.register(observability.flush_traces)
 
 # Page title and description
 st.title("Data Generation")
@@ -516,7 +669,7 @@ if uploaded_file:
                 generate_data_workflow_from_ddl(instructions, temperature, num_records, st.session_state["uploaded_ddl"], drop_existing=True)
 
 # Data preview interface
-if "generated_tables" in st.session_state:
+if "generated_tables" in st.session_state and st.session_state["generated_tables"]:
     st.subheader("📊 Generated Data Preview")
     
     # Create tabs for each table
@@ -592,7 +745,7 @@ if "generated_tables" in st.session_state:
                             st.rerun()
 
 # Export functionality
-if "generated_tables" in st.session_state:
+if "generated_tables" in st.session_state and st.session_state["generated_tables"]:
     st.subheader("📥 Download Generated Data")
     
     col1, col2 = st.columns(2)

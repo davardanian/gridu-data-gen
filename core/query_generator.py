@@ -8,7 +8,9 @@ import streamlit as st
 import pandas as pd
 import matplotlib.pyplot as plt
 from typing import Optional, Dict, Any
+from langfuse import observe
 from core.ai_client import AIClient
+from core.observability import observability
 
 
 class QueryGenerator:
@@ -17,9 +19,18 @@ class QueryGenerator:
     def __init__(self):
         self.ai_client = AIClient()
     
+    @observe(name="sql_query_generation")
     def generate_sql_query(self, natural_language_query: str, schema_info: Dict[str, Any]) -> Optional[str]:
         """Generate SQL query from natural language"""
         try:
+            # Log the SQL generation attempt
+            observability.log_ai_operation(
+                "sql_generation_start",
+                model="gemini-2.5-flash",
+                query_length=len(natural_language_query),
+                schema_tables=len(schema_info)
+            )
+            
             prompt = self._create_sql_generation_prompt(natural_language_query, schema_info)
             from config.settings import settings
             response = self.ai_client.generate_content(
@@ -31,13 +42,35 @@ class QueryGenerator:
             if response:
                 sql_query = self._extract_sql_from_response(response)
                 if sql_query and self._validate_sql_against_schema(sql_query, schema_info):
+                    observability.log_ai_operation(
+                        "sql_generation_success",
+                        model="gemini-2.5-flash",
+                        sql_length=len(sql_query)
+                    )
                     return sql_query
                 elif sql_query:
+                    observability.log_ai_operation(
+                        "sql_generation_validation_failed",
+                        model="gemini-2.5-flash",
+                        reason="invalid_columns"
+                    )
                     st.warning("Generated SQL query contains invalid columns. Trying alternative approach...")
                     return None
+            else:
+                observability.log_ai_operation(
+                    "sql_generation_failed",
+                    model="gemini-2.5-flash",
+                    reason="no_response"
+                )
             return None
             
         except Exception as e:
+            observability.log_ai_operation(
+                "sql_generation_error",
+                model="gemini-2.5-flash",
+                error=str(e)
+            )
+            observability.log_exception(e, "sql_query_generation")
             st.error(f"❌ SQL generation failed: {str(e)}")
             return None
     
@@ -155,30 +188,70 @@ Generate the SQL query:
             st.error(f"Error validating SQL: {str(e)}")
             return False
     
+    @observe(name="sql_query_execution")
     def execute_query(self, sql_query: str) -> Optional[pd.DataFrame]:
         """Execute SQL query against PostgreSQL database and return results"""
         try:
             from core.database_manager import DatabaseManager
+            import time
+            
+            start_time = time.time()
+            
+            # Log query execution start
+            observability.log_database_operation(
+                "query_execution_start",
+                query_length=len(sql_query),
+                query_type="SELECT" if sql_query.strip().upper().startswith("SELECT") else "OTHER"
+            )
             
             st.info("🔍 Executing SQL query against PostgreSQL database")
             
             db_manager = DatabaseManager()
             # Check if database is connected
             if not db_manager.is_connected():
+                observability.log_database_operation(
+                    "query_execution_failed",
+                    reason="database_not_connected"
+                )
                 st.error("❌ Database not connected")
                 return None
             
             # Execute query using database manager
             result = db_manager.execute_query(sql_query, ttl=0)  # No caching for real-time queries
             
+            execution_time = time.time() - start_time
+            
             if result is not None:
+                observability.log_database_operation(
+                    "query_execution_success",
+                    rows_returned=len(result),
+                    execution_time=execution_time,
+                    columns_returned=len(result.columns) if hasattr(result, 'columns') else 0
+                )
+                observability.log_performance(
+                    "sql_query_execution",
+                    execution_time,
+                    rows=len(result),
+                    columns=len(result.columns) if hasattr(result, 'columns') else 0
+                )
                 st.success(f"✅ SQL query executed successfully - {len(result)} rows returned")
                 return result
             else:
+                observability.log_database_operation(
+                    "query_execution_no_results",
+                    execution_time=execution_time
+                )
                 st.error("❌ SQL query returned no results")
                 return None
                 
         except Exception as e:
+            execution_time = time.time() - start_time if 'start_time' in locals() else 0
+            observability.log_database_operation(
+                "query_execution_error",
+                error=str(e),
+                execution_time=execution_time
+            )
+            observability.log_exception(e, "sql_query_execution")
             st.error(f"❌ Query execution failed: {str(e)}")
             return None
     
@@ -259,9 +332,18 @@ Response:"""
         
         return "general"
     
+    @observe(name="visualization_query_generation")
     def generate_visualization_query(self, natural_language_query: str, schema_info: Dict[str, Any]) -> Optional[str]:
         """Generate SQL query for visualization from natural language"""
         try:
+            # Log visualization query generation attempt
+            observability.log_ai_operation(
+                "visualization_query_generation_start",
+                model="gemini-2.5-flash",
+                query_length=len(natural_language_query),
+                schema_tables=len(schema_info)
+            )
+            
             prompt = self._create_visualization_generation_prompt(natural_language_query, schema_info)
             from config.settings import settings
             response = self.ai_client.generate_content(
@@ -273,13 +355,35 @@ Response:"""
             if response:
                 sql_query = self._extract_sql_from_response(response)
                 if sql_query and self._validate_sql_against_schema(sql_query, schema_info):
+                    observability.log_ai_operation(
+                        "visualization_query_generation_success",
+                        model="gemini-2.5-flash",
+                        sql_length=len(sql_query)
+                    )
                     return sql_query
                 elif sql_query:
+                    observability.log_ai_operation(
+                        "visualization_query_generation_validation_failed",
+                        model="gemini-2.5-flash",
+                        reason="invalid_columns"
+                    )
                     st.warning("Generated visualization query contains invalid columns. Trying alternative approach...")
                     return None
+            else:
+                observability.log_ai_operation(
+                    "visualization_query_generation_failed",
+                    model="gemini-2.5-flash",
+                    reason="no_response"
+                )
             return None
             
         except Exception as e:
+            observability.log_ai_operation(
+                "visualization_query_generation_error",
+                model="gemini-2.5-flash",
+                error=str(e)
+            )
+            observability.log_exception(e, "visualization_query_generation")
             st.error(f"❌ Visualization query generation failed: {str(e)}")
             return None
     

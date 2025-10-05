@@ -71,6 +71,7 @@ class ObservabilityManager:
                     host=settings.LANGFUSE_HOST
                 )
                 self.logger.info("✅ Langfuse initialized successfully")
+                
             except Exception as e:
                 self.logger.error(f"❌ Failed to initialize Langfuse: {str(e)}")
         else:
@@ -85,6 +86,76 @@ class ObservabilityManager:
             except Exception as e:
                 self.logger.error(f"Failed to create trace: {str(e)}")
         return None
+    
+    def create_trace(self, name: str, user_id: str = None, session_id: str = None, 
+                    input_data: dict = None, metadata: dict = None, tags: list = None):
+        """Create a new Langfuse trace with proper structure"""
+        if not self.langfuse:
+            return None
+            
+        try:
+            # Use start_span for manual span creation in Langfuse 3.x
+            # This creates a span that we can manage manually
+            trace = self.langfuse.start_span(
+                name=name,
+                input=input_data,
+                metadata=metadata or {}
+            )
+            
+            # Set trace-level attributes using update_trace
+            if user_id or session_id or tags:
+                trace.update_trace(
+                    user_id=user_id,
+                    session_id=session_id,
+                    tags=tags
+                )
+            
+            self.logger.info(f"✅ Created Langfuse trace: {name}")
+            return trace
+        except Exception as e:
+            self.logger.error(f"❌ Failed to create trace '{name}': {str(e)}")
+            return None
+    
+    def create_generation(self, trace, name: str, model: str = None, 
+                         input_data: str = None, output_data: str = None, 
+                         metadata: dict = None):
+        """Create a generation within a trace"""
+        if not trace or not self.langfuse:
+            return None
+            
+        try:
+            # Use start_generation for manual generation creation in Langfuse 3.x
+            generation = self.langfuse.start_generation(
+                name=name,
+                model=model,
+                input=input_data,
+                output=output_data,
+                metadata=metadata or {}
+            )
+                
+            self.logger.info(f"✅ Created generation: {name}")
+            return generation
+        except Exception as e:
+            self.logger.error(f"❌ Failed to create generation '{name}': {str(e)}")
+            return None
+    
+    def flush_traces(self):
+        """Flush all pending traces to Langfuse"""
+        if self.langfuse:
+            try:
+                self.langfuse.flush()
+                self.logger.info("✅ Flushed traces to Langfuse")
+            except Exception as e:
+                self.logger.error(f"❌ Failed to flush traces: {str(e)}")
+    
+    def shutdown(self):
+        """Shutdown Langfuse client and flush remaining traces"""
+        if self.langfuse:
+            try:
+                self.langfuse.shutdown()
+                self.logger.info("✅ Langfuse client shutdown complete")
+            except Exception as e:
+                self.logger.error(f"❌ Failed to shutdown Langfuse: {str(e)}")
     
     def log_info(self, message: str, **kwargs):
         """Log info message with context"""
@@ -163,6 +234,50 @@ class ObservabilityManager:
         context = " | ".join([f"{k}={v}" for k, v in kwargs.items()])
         status_emoji = {"start": "🔄", "success": "✅", "error": "❌", "warning": "⚠️"}.get(status, "ℹ️")
         self.logger.info(f"{status_emoji} WORKFLOW | {workflow} | {step} | {status} | {context}")
+    
+    def get_langfuse_client(self):
+        """Get the Langfuse client instance"""
+        return self.langfuse
+    
+    def is_langfuse_enabled(self):
+        """Check if Langfuse is properly configured and enabled"""
+        return self.langfuse is not None
+    
+    def update_current_trace(self, **kwargs):
+        """Update the current trace with additional information"""
+        if self.langfuse:
+            try:
+                self.langfuse.update_current_trace(**kwargs)
+                self.logger.debug(f"Updated current trace with: {kwargs}")
+            except Exception as e:
+                self.logger.error(f"Failed to update current trace: {str(e)}")
+    
+    def update_current_observation(self, **kwargs):
+        """Update the current observation with additional information"""
+        if self.langfuse:
+            try:
+                self.langfuse.update_current_span(**kwargs)
+                self.logger.debug(f"Updated current observation with: {kwargs}")
+            except Exception as e:
+                self.logger.error(f"Failed to update current observation: {str(e)}")
+    
+    def score_current_trace(self, name: str, value: float, comment: str = None):
+        """Score the current trace"""
+        if self.langfuse:
+            try:
+                self.langfuse.score_current_trace(name=name, value=value, comment=comment)
+                self.logger.info(f"Scored current trace: {name}={value}")
+            except Exception as e:
+                self.logger.error(f"Failed to score current trace: {str(e)}")
+    
+    def score_current_observation(self, name: str, value: float, comment: str = None):
+        """Score the current observation"""
+        if self.langfuse:
+            try:
+                self.langfuse.score_current_span(name=name, value=value, comment=comment)
+                self.logger.info(f"Scored current observation: {name}={value}")
+            except Exception as e:
+                self.logger.error(f"Failed to score current observation: {str(e)}")
 
 # Global observability manager
 observability = ObservabilityManager()

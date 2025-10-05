@@ -5,6 +5,7 @@ from core.auth_manager import auth_manager
 from core.query_generator import QueryGenerator
 from core.guardrails import GuardrailsManager
 from utils.visualization import VisualizationManager
+from core.observability import observability
 
 # Initialize managers
 query_generator = QueryGenerator()
@@ -14,9 +15,24 @@ viz_manager = VisualizationManager()
 # Helper functions
 def process_data_query(prompt):
     """Process user query and generate appropriate response"""
+    # Log user interaction
+    observability.log_user_action(
+        "data_query_submitted",
+        query_length=len(prompt),
+        has_data=bool(st.session_state.get("generated_tables")),
+        tables_available=len(st.session_state.get("generated_tables", {}))
+    )
+    
     with st.chat_message("assistant"):
         # Determine query type
         query_type = query_generator.classify_query_type(prompt)
+        
+        # Log query classification
+        observability.log_user_action(
+            "query_classified",
+            query_type=query_type,
+            original_query=prompt[:100] + "..." if len(prompt) > 100 else prompt
+        )
         
         if query_type == "sql_generation":
             response = handle_sql_generation(prompt)
@@ -26,6 +42,14 @@ def process_data_query(prompt):
             response = handle_visualization_request(prompt)
         else:
             response = handle_general_query(prompt)
+        
+        # Log response generation
+        observability.log_user_action(
+            "query_response_generated",
+            query_type=query_type,
+            response_length=len(response) if response else 0,
+            success=bool(response and response != "Error")
+        )
         
         # Display response 
         st.chat_message("assistant").write(response)
@@ -361,16 +385,38 @@ for message in st.session_state.messages:
 
 # Enhanced chat input
 if prompt := st.chat_input("💬 Ask me about your data... (e.g., 'Show me sales by region', 'Create a bar chart', 'Analyze the data')"):
+    # Log user input attempt
+    observability.log_user_action(
+        "chat_input_attempt",
+        input_length=len(prompt),
+        session_messages=len(st.session_state.get("messages", []))
+    )
+    
     auth_status = auth_manager.get_authentication_status()
     if not auth_status["authenticated"] and "gemini_client" not in st.session_state:
+        observability.log_user_action(
+            "chat_input_blocked",
+            reason="not_authenticated"
+        )
         st.error("Please authenticate to continue.")
         st.stop()
     
     # Validate input
     validation = guardrails.validate_input(prompt, "query")
     if not validation["is_valid"]:
+        observability.log_user_action(
+            "chat_input_blocked",
+            reason="validation_failed",
+            validation_errors=validation.get("errors", [])
+        )
         st.error("Invalid input detected. Please try again.")
         st.stop()
+    
+    # Log successful input validation
+    observability.log_user_action(
+        "chat_input_validated",
+        input_length=len(prompt)
+    )
     
     # Add user message
     st.session_state.messages.append({"role": "user", "content": prompt})

@@ -10,12 +10,15 @@ This module orchestrates the entire data generation workflow:
 
 import streamlit as st
 import logging
+import time
 from typing import Dict, List, Optional
 import pandas as pd
+from langfuse import observe
 
 from core.ddl_parser import DDLParser, Table
 from core.synthetic_data_engine import SyntheticDataEngine
 from core.database_manager import DatabaseManager
+from core.observability import observability
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +30,7 @@ class DataGenerationOrchestrator:
         self.data_engine = SyntheticDataEngine()
         self.db_manager = None
     
+    @observe(name="data_generation_workflow")
     def generate_from_ddl(self, ddl_content: str, instructions: Optional[str] = None, 
                          temperature: float = 0.1, num_records: int = 100,
                          database_url: Optional[str] = None) -> Dict[str, pd.DataFrame]:
@@ -43,17 +47,56 @@ class DataGenerationOrchestrator:
         Returns:
             Dictionary mapping table names to DataFrames
         """
+        start_time = time.time()
+        
         try:
+            # Log workflow start
+            observability.log_workflow_step(
+                "data_generation_workflow",
+                "start",
+                "start",
+                ddl_length=len(ddl_content),
+                num_records=num_records,
+                temperature=temperature,
+                has_instructions=bool(instructions)
+            )
+            
             # Parse DDL to get table structures
+            observability.log_workflow_step(
+                "data_generation_workflow",
+                "ddl_parsing",
+                "start"
+            )
+            
             tables = self.ddl_parser.parse_ddl(ddl_content)
             
             if not tables:
+                observability.log_workflow_step(
+                    "data_generation_workflow",
+                    "ddl_parsing",
+                    "error",
+                    reason="no_tables_found"
+                )
                 st.error("❌ No tables found in DDL")
                 return {}
             
+            observability.log_workflow_step(
+                "data_generation_workflow",
+                "ddl_parsing",
+                "success",
+                tables_parsed=len(tables)
+            )
             st.success(f"✅ Parsed {len(tables)} tables from DDL")
             
             # Generate synthetic data
+            observability.log_workflow_step(
+                "data_generation_workflow",
+                "synthetic_data_generation",
+                "start",
+                tables_count=len(tables),
+                rows_per_table=num_records
+            )
+            
             generated_data = self.data_engine.generate_data(
                 tables=tables,
                 generation_prompt=instructions or "",
@@ -62,19 +105,67 @@ class DataGenerationOrchestrator:
             )
             
             if not generated_data:
+                observability.log_workflow_step(
+                    "data_generation_workflow",
+                    "synthetic_data_generation",
+                    "error",
+                    reason="no_data_generated"
+                )
                 st.error("❌ Failed to generate any data")
                 return {}
             
+            observability.log_workflow_step(
+                "data_generation_workflow",
+                "synthetic_data_generation",
+                "success",
+                tables_generated=len(generated_data)
+            )
             st.success(f"✅ Generated data for {len(generated_data)} tables")
             
             # Store in database if URL provided
             if database_url:
+                observability.log_workflow_step(
+                    "data_generation_workflow",
+                    "database_storage",
+                    "start"
+                )
                 st.info("💾 Storing data in database...")
                 self._store_data_in_database(ddl_content, generated_data, database_url)
+                observability.log_workflow_step(
+                    "data_generation_workflow",
+                    "database_storage",
+                    "success"
+                )
+            
+            # Log workflow completion
+            total_duration = time.time() - start_time
+            observability.log_workflow_step(
+                "data_generation_workflow",
+                "complete",
+                "success",
+                total_duration=total_duration,
+                tables_generated=len(generated_data),
+                total_records=sum(len(df) for df in generated_data.values())
+            )
+            observability.log_performance(
+                "complete_data_generation_workflow",
+                total_duration,
+                tables=len(generated_data),
+                records_per_table=num_records
+            )
             
             return generated_data
             
         except Exception as e:
+            total_duration = time.time() - start_time
+            observability.log_workflow_step(
+                "data_generation_workflow",
+                "error",
+                "error",
+                error=str(e),
+                duration=total_duration
+            )
+            observability.log_exception(e, "data_generation_workflow")
             st.error(f"❌ Error in data generation: {str(e)}")
             logger.error(f"Error in data generation: {e}")
             return {}
